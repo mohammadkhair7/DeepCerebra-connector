@@ -149,6 +149,56 @@ def test_sync_stays_in_workspace_even_with_host_scope(tmp_path):
         ex.sync([{"path": "../proj/evil.txt", "content": "x"}])
 
 
+# ── cancellation (web-terminal Ctrl+C) ────────────────────────────────────────
+
+def test_on_spawn_receives_process_and_kill_interrupts(tmp_path):
+    """A long-running command dies quickly when its tree is killed via the
+    handle passed to on_spawn — the mechanism behind web-terminal Ctrl+C."""
+    import threading
+    import time
+
+    from dcc_bridge.local_exec import kill_process_tree
+
+    ex = LocalExec(tmp_path / "ws")
+    procs = []
+
+    def killer():
+        # Wait for spawn, then kill.
+        for _ in range(100):
+            if procs:
+                kill_process_tree(procs[0])
+                return
+            time.sleep(0.05)
+
+    t = threading.Thread(target=killer)
+    t.start()
+    started = time.monotonic()
+    sleep_cmd = (
+        "ping -n 30 127.0.0.1 > NUL" if sys.platform == "win32" else "sleep 30"
+    )
+    res = ex.run(sleep_cmd, timeout=60, on_spawn=procs.append)
+    elapsed = time.monotonic() - started
+    t.join()
+    assert res["return_code"] != 0
+    assert elapsed < 25  # killed long before the command's natural 30s
+
+
+def test_run_stdin_is_closed_so_prompts_do_not_hang(tmp_path):
+    """The relay is non-interactive: a command reading stdin sees EOF at once
+    instead of hanging until the timeout."""
+    import time
+
+    ex = LocalExec(tmp_path / "ws")
+    cmd = (
+        "set /p x= && echo got-%x%" if sys.platform == "win32"
+        else "read x; echo got-$x"
+    )
+    started = time.monotonic()
+    res = ex.run(cmd, timeout=30)
+    assert time.monotonic() - started < 10  # returned immediately, no hang
+    assert res["return_code"] is not None
+
+
 def test_describe_advertises_scope_and_roots(tmp_path):
     proj = tmp_path / "proj"
     proj.mkdir()

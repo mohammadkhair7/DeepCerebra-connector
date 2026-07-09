@@ -22,7 +22,7 @@ import websockets
 from termcolor import cprint
 
 from .backends import discover_all
-from .local_exec import LocalExec, WorkspaceViolation
+from .local_exec import LocalExec, WorkspaceViolation, kill_process_tree
 
 # ── Major config (all caps, top of module) ──────────────────────────────
 RECONNECT_BASE_DELAY_SEC = 2
@@ -51,6 +51,10 @@ class BridgeConnector:
         self.lmstudio_host = lmstudio_host
         self._objs: Dict[str, Any] = {}
         self._tasks: Dict[str, asyncio.Task] = {}
+        # Live exec subprocesses by request id, so a `cancel` frame (web
+        # terminal Ctrl+C) can kill the whole process tree mid-run.
+        self._procs: Dict[str, Any] = {}
+        self._cancelled: set = set()
         # Local exec relay — the user authorizes it per device. By default every
         # command is confined to the workspace folder; host_dirs / allow_any_dir
         # opt into running in the user's real project directories (so their
@@ -173,9 +177,18 @@ class BridgeConnector:
             self._tasks[rid] = asyncio.create_task(self._run_exec(ws, frame))
         elif ftype == "cancel":
             rid = frame.get("request_id")
-            task = self._tasks.pop(rid, None)
-            if task:
-                task.cancel()
+            proc = self._procs.get(rid)
+            if proc is not None:
+                # Exec cancel (web-terminal Ctrl+C): kill the process tree and
+                # let the awaiting _run_exec finish naturally, so a single
+                # exec_result reply still flows back to the gateway.
+                self._cancelled.add(rid)
+                cprint(f"[connector] cancel req {str(rid)[:8]} - killing process tree", "yellow")
+                asyncio.get_event_loop().run_in_executor(None, kill_process_tree, proc)
+            else:
+                task = self._tasks.pop(rid, None)
+                if task:
+                    task.cancel()
         elif ftype == "revoked":
             cprint("[connector] this device was revoked from the web app. Stopping.", "red")
             await ws.close()
@@ -233,10 +246,19 @@ class BridgeConnector:
                 cwd = str(frame.get("cwd") or "")
                 timeout = int(frame.get("timeout") or 0)
                 cprint(f"[connector] -> exec (req {str(rid)[:8]}): {command[:120]}", "cyan")
-                result = await asyncio.to_thread(self.exec.run, command, cwd, timeout)
+                result = await asyncio.to_thread(
+                    self.exec.run, command, cwd, timeout,
+                    lambda p: self._procs.__setitem__(rid, p),
+                )
+                if rid in self._cancelled:
+                    result["return_code"] = 130
+                    result["stderr"] = (str(result.get("stderr") or "") +
+                                        "\n[cancelled by user]").lstrip("\n")
+                    cprint(f"[connector] exec cancelled (req {str(rid)[:8]})", "yellow")
+                else:
+                    cprint(f"[connector] exec done rc={result.get('return_code')} (req {str(rid)[:8]})",
+                           "green" if result.get("return_code") == 0 else "yellow")
                 reply.update(ok=True, **result)
-                cprint(f"[connector] exec done rc={result.get('return_code')} (req {str(rid)[:8]})",
-                       "green" if result.get("return_code") == 0 else "yellow")
         except WorkspaceViolation as e:
             reply["error"] = str(e)
         except asyncio.CancelledError:
@@ -245,6 +267,8 @@ class BridgeConnector:
             reply["error"] = f"{type(e).__name__}: {e}"
         finally:
             self._tasks.pop(rid, None)
+            self._procs.pop(rid, None)
+            self._cancelled.discard(rid)
         await self._safe_send(ws, reply)
 
     @staticmethod

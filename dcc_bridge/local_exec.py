@@ -31,9 +31,10 @@ whichever paired computer is online.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # Mirror the server sandbox's sync caps so a malicious/buggy page can't fill
 # the disk through the relay.
@@ -176,31 +177,97 @@ class LocalExec:
         return {"written": written, "workspace": str(self.workspace)}
 
     # ── command execution ────────────────────────────────────────────────
-    def run(self, command: str, cwd: str = "", timeout: int = DEFAULT_TIMEOUT_SEC) -> Dict[str, Any]:
-        """Run one shell command. cwd is confined per the active scope."""
+    def run(
+        self,
+        command: str,
+        cwd: str = "",
+        timeout: int = DEFAULT_TIMEOUT_SEC,
+        on_spawn: Optional[Callable[[subprocess.Popen], None]] = None,
+    ) -> Dict[str, Any]:
+        """Run one shell command. cwd is confined per the active scope.
+
+        The relay is NON-INTERACTIVE: stdin is /dev/null, so a command that
+        prompts for input (interactive menus, confirmations) errors or ends
+        quickly instead of hanging until the timeout — callers should use
+        non-interactive flags. ``on_spawn`` receives the Popen handle so the
+        connector can kill the whole process tree on user cancellation
+        (Ctrl+C in the web terminal).
+        """
         workdir = self.resolve_cwd(cwd)
         timeout = max(1, min(int(timeout or DEFAULT_TIMEOUT_SEC), MAX_TIMEOUT_SEC))
+        popen_kwargs: Dict[str, Any] = {}
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            # Own process group so a cancel can signal the whole tree.
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=str(workdir),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **popen_kwargs,
+        )
+        if on_spawn is not None:
+            try:
+                on_spawn(proc)
+            except Exception:  # noqa: BLE001 — registration must never break the run
+                pass
         try:
-            proc = subprocess.run(
-                command,
-                shell=True,
-                cwd=str(workdir),
-                capture_output=True,
-                timeout=timeout,
-            )
+            out, err = proc.communicate(timeout=timeout)
             return {
                 "return_code": proc.returncode,
-                "stdout": _cap(proc.stdout),
-                "stderr": _cap(proc.stderr),
+                "stdout": _cap(out),
+                "stderr": _cap(err),
                 "cwd": str(workdir),
             }
         except subprocess.TimeoutExpired:
+            kill_process_tree(proc)
+            try:
+                out, err = proc.communicate(timeout=10)
+            except Exception:  # noqa: BLE001
+                out, err = b"", b""
             return {
                 "return_code": 124,
-                "stdout": "",
-                "stderr": f"command timed out after {timeout}s",
+                "stdout": _cap(out),
+                "stderr": _cap(err) + (
+                    f"\ncommand timed out after {timeout}s. Note: this relay is "
+                    "non-interactive — if the command was waiting for input "
+                    "(menu/confirmation), rerun it with non-interactive flags."
+                ).lstrip("\n"),
                 "cwd": str(workdir),
             }
+
+
+def kill_process_tree(proc: subprocess.Popen) -> None:
+    """Terminate a relayed command AND everything it spawned (with shell=True
+    the real work happens in child processes). Used for user cancellation
+    (web-terminal Ctrl+C) and for timeouts."""
+    try:
+        if os.name == "nt":
+            # taskkill /T walks the child tree; /F forces. More reliable than
+            # CTRL_BREAK for arbitrary console-less shells.
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=10,
+            )
+        else:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=2)
+            except Exception:  # noqa: BLE001
+                os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    except Exception:  # noqa: BLE001
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _cap(raw: bytes | None) -> str:
