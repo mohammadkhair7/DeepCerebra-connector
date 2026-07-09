@@ -197,9 +197,17 @@ class LocalExec:
         timeout = max(1, min(int(timeout or DEFAULT_TIMEOUT_SEC), MAX_TIMEOUT_SEC))
         popen_kwargs: Dict[str, Any] = {}
         if os.name == "nt":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            # NEW_PROCESS_GROUP: lets a cancel signal the whole tree.
+            # CREATE_NO_WINDOW: detach from the connector's own console so an
+            # interactive TUI (e.g. bare `railway link`) can't read our console
+            # and hang forever — with no console it errors out immediately.
+            popen_kwargs["creationflags"] = (
+                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            )
         else:
-            # Own process group so a cancel can signal the whole tree.
+            # Own session (no controlling TTY) so a command that tries to read
+            # /dev/tty fails fast instead of blocking, and a cancel can signal
+            # the whole process group.
             popen_kwargs["start_new_session"] = True
         proc = subprocess.Popen(
             command,
