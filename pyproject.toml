@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dcc-bridge"
+version = "1.1.0"
+description = "DeepCerebra Bridge Connector - relay your local GPU models and console/terminal into the DeepCerebra web app."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+dependencies = [
+    "websockets",
+    "httpx",
+    "openai",
+    "termcolor",
+]
+
+[project.scripts]
+# Installs a `dcc-bridge` command on PATH, so the connector runs from ANY
+# directory (no need to cd into the repo or set PYTHONPATH).
+dcc-bridge = "dcc_bridge.__main__:main"
+
+[tool.setuptools]
+packages = ["dcc_bridge"]
