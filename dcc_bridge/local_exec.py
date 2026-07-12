@@ -43,7 +43,9 @@ MAX_TOTAL_BYTES = 32 * 1024 * 1024   # 32 MB per sync
 MAX_FILE_BYTES = 2 * 1024 * 1024     # 2 MB per file
 MAX_OUTPUT_BYTES = 1 * 1024 * 1024   # 1 MB stdout / stderr each
 DEFAULT_TIMEOUT_SEC = 300
-MAX_TIMEOUT_SEC = 900
+# Builds (docker compose build, npm ci, …) legitimately run for many minutes;
+# 30 min cap. The gateway's relay wait (DCC_BRIDGE_EXEC_TIMEOUT_SEC) is higher.
+MAX_TIMEOUT_SEC = 1800
 
 
 class WorkspaceViolation(Exception):
