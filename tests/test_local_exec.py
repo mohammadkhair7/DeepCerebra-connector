@@ -199,6 +199,81 @@ def test_run_stdin_is_closed_so_prompts_do_not_hang(tmp_path):
     assert res["return_code"] is not None
 
 
+# ── reverse sync (snapshot of command-created files) ─────────────────────────
+
+def test_snapshot_returns_files_created_after_since(tmp_path):
+    import time
+
+    ex = LocalExec(tmp_path / "ws")
+    (ex.workspace / "old.txt").write_text("old")
+    since = time.time() + 5  # nothing yet is newer than this
+    (ex.workspace / "railway.json").write_text('{"a": 1}')
+    # Only the file whose mtime clears the cutoff (since - epsilon) is eligible;
+    # bump the new file's mtime clearly past `since`.
+    import os
+    os.utime(ex.workspace / "railway.json", (since + 10, since + 10))
+    result = ex.snapshot("", since)
+    paths = [f["path"] for f in result["files"]]
+    assert "railway.json" in paths
+    assert "old.txt" not in paths
+
+
+def test_snapshot_includes_everything_with_since_zero(tmp_path):
+    ex = LocalExec(tmp_path / "ws")
+    (ex.workspace / "a.py").write_text("print(1)")
+    sub = ex.workspace / "pkg"
+    sub.mkdir()
+    (sub / "b.md").write_text("# doc")
+    result = ex.snapshot("", 0.0)
+    paths = sorted(f["path"] for f in result["files"])
+    assert paths == ["a.py", "pkg/b.md"]
+    assert result["count"] == 2
+    assert result["truncated"] is False
+
+
+def test_snapshot_skips_ignored_dirs_and_binaries(tmp_path):
+    ex = LocalExec(tmp_path / "ws")
+    nm = ex.workspace / "node_modules" / "dep"
+    nm.mkdir(parents=True)
+    (nm / "index.js").write_text("x")
+    (ex.workspace / "photo.png").write_bytes(b"\x89PNG")
+    (ex.workspace / "fake.json").write_bytes(b"\x00\x01binary despite extension")
+    (ex.workspace / "keep.json").write_text("{}")
+    result = ex.snapshot("", 0.0)
+    paths = [f["path"] for f in result["files"]]
+    assert paths == ["keep.json"]
+
+
+def test_snapshot_respects_host_scope_confinement(tmp_path):
+    ex = LocalExec(tmp_path / "ws")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("nope")
+    # Workspace scope: an absolute host path must not be readable.
+    with pytest.raises(WorkspaceViolation):
+        ex.snapshot(str(outside), 0.0)
+
+
+def test_snapshot_host_scope_reads_granted_root(tmp_path):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "made-by-cli.json").write_text("{}")
+    ex = LocalExec(tmp_path / "ws", host_roots=[proj])
+    result = ex.snapshot(str(proj), 0.0)
+    assert [f["path"] for f in result["files"]] == ["made-by-cli.json"]
+    assert result["root"] == str(proj)
+
+
+def test_run_result_carries_started_at(tmp_path):
+    import time
+
+    ex = LocalExec(tmp_path / "ws")
+    before = time.time()
+    res = ex.run("echo hi")
+    assert isinstance(res.get("started_at"), float)
+    assert before - 1 <= res["started_at"] <= time.time() + 1
+
+
 def test_describe_advertises_scope_and_roots(tmp_path):
     proj = tmp_path / "proj"
     proj.mkdir()

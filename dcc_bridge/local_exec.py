@@ -33,6 +33,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -46,6 +47,46 @@ DEFAULT_TIMEOUT_SEC = 300
 # Builds (docker compose build, npm ci, …) legitimately run for many minutes;
 # 30 min cap. The gateway's relay wait (DCC_BRIDGE_EXEC_TIMEOUT_SEC) is higher.
 MAX_TIMEOUT_SEC = 1800
+
+# ── Reverse-sync (snapshot) tuning ───────────────────────────────────────────
+# After a command runs on this machine it may CREATE files (e.g. `railway link`
+# writing railway.json, a scaffolder emitting sources). Those live only on disk
+# here; the web app's Project Explorer reads the browser VFS, so without pulling
+# them back the file "vanishes" from the tree. snapshot() returns files under
+# the command's working directory that changed since it started, bounded like a
+# sync and skipping heavy/generated trees the explorer never shows anyway.
+SNAPSHOT_IGNORED_DIRS = {
+    ".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache",
+    ".pytest_cache", ".next", ".nuxt", "dist", "build", ".cache", ".turbo",
+    ".gradle", "target", ".idea", ".DS_Store", ".terraform", "vendor",
+    ".svelte-kit", "coverage", ".parcel-cache", "bin", "obj",
+}
+# mtime granularity + small clock jitter: include files touched slightly before
+# the recorded start so a fast command's output is never missed.
+SNAPSHOT_MTIME_EPSILON_SEC = 2.0
+# Extensions we treat as textual (VFS is text-only). Anything else is skipped;
+# a NUL-byte sniff is the final guard for mislabeled files.
+SNAPSHOT_TEXT_EXT = {
+    ".txt", ".md", ".markdown", ".rst", ".json", ".jsonc", ".json5", ".yaml",
+    ".yml", ".toml", ".ini", ".cfg", ".conf", ".env", ".properties",
+    ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue",
+    ".svelte", ".html", ".htm", ".css", ".scss", ".sass", ".less",
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".cs", ".java", ".kt", ".kts",
+    ".go", ".rs", ".rb", ".php", ".swift", ".m", ".mm", ".scala", ".clj",
+    ".sh", ".bash", ".zsh", ".fish", ".ps1", ".psm1", ".bat", ".cmd",
+    ".sql", ".graphql", ".gql", ".proto", ".xml", ".svg", ".csv", ".tsv",
+    ".gitignore", ".dockerignore", ".editorconfig", ".gitattributes",
+    "dockerfile", "makefile", "procfile", ".lock", ".r", ".jl", ".dart",
+    ".tf", ".tfvars", ".hcl", ".gradle", ".ipynb", ".tex",
+}
+
+
+def _looks_textual(name: str) -> bool:
+    low = name.lower()
+    if low in SNAPSHOT_TEXT_EXT:  # extensionless conventions (Dockerfile, Makefile)
+        return True
+    ext = os.path.splitext(low)[1]
+    return ext in SNAPSHOT_TEXT_EXT
 
 
 class WorkspaceViolation(Exception):
@@ -196,6 +237,9 @@ class LocalExec:
         (Ctrl+C in the web terminal).
         """
         workdir = self.resolve_cwd(cwd)
+        # Recorded on THIS machine's clock so a follow-up snapshot() can find the
+        # files the command created without any cross-machine clock skew.
+        started_at = time.time()
         timeout = max(1, min(int(timeout or DEFAULT_TIMEOUT_SEC), MAX_TIMEOUT_SEC))
         popen_kwargs: Dict[str, Any] = {}
         if os.name == "nt":
@@ -232,6 +276,7 @@ class LocalExec:
                 "stdout": _cap(out),
                 "stderr": _cap(err),
                 "cwd": str(workdir),
+                "started_at": started_at,
             }
         except subprocess.TimeoutExpired:
             kill_process_tree(proc)
@@ -248,7 +293,72 @@ class LocalExec:
                     "(menu/confirmation), rerun it with non-interactive flags."
                 ).lstrip("\n"),
                 "cwd": str(workdir),
+                "started_at": started_at,
             }
+
+    # ── reverse sync (snapshot files a command created/changed) ─────────────
+    def snapshot(self, cwd: str, since: float) -> Dict[str, Any]:
+        """Return files under the command's working directory that changed at or
+        after ``since`` (epoch seconds on THIS machine), so the web app can pull
+        command-created files (e.g. railway.json) back into the browser VFS and
+        show them in the Project Explorer.
+
+        Confinement mirrors execution: the root is resolved exactly like a
+        command cwd (workspace-relative, or an absolute host dir inside a granted
+        root), so a page can never read outside what the owner authorized. Heavy
+        / generated trees and binaries are skipped, and the payload is bounded.
+        """
+        base = self.resolve_cwd(cwd)
+        cutoff = float(since) - SNAPSHOT_MTIME_EPSILON_SEC
+        files: List[Dict[str, Any]] = []
+        total = 0
+        scanned = 0
+        truncated = False
+        for dirpath, dirnames, filenames in os.walk(base):
+            # Prune heavy/generated dirs in place so os.walk never descends them.
+            dirnames[:] = [d for d in dirnames if d not in SNAPSHOT_IGNORED_DIRS]
+            for fname in filenames:
+                scanned += 1
+                if scanned > 200_000:  # pathological tree guard
+                    truncated = True
+                    break
+                if not _looks_textual(fname):
+                    continue
+                fpath = Path(dirpath) / fname
+                try:
+                    st = fpath.stat()
+                except OSError:
+                    continue
+                if st.st_mtime < cutoff:
+                    continue
+                if st.st_size > MAX_FILE_BYTES:
+                    continue
+                try:
+                    raw = fpath.read_bytes()
+                except OSError:
+                    continue
+                if b"\x00" in raw[:8192]:  # binary despite a textual extension
+                    continue
+                total += len(raw)
+                if total > MAX_TOTAL_BYTES:
+                    truncated = True
+                    break
+                try:
+                    rel = fpath.relative_to(base).as_posix()
+                except ValueError:
+                    continue
+                files.append({"path": rel, "content": raw.decode("utf-8", "replace")})
+                if len(files) >= MAX_FILES:
+                    truncated = True
+                    break
+            if truncated:
+                break
+        return {
+            "files": files,
+            "root": str(base),
+            "count": len(files),
+            "truncated": truncated,
+        }
 
 
 def kill_process_tree(proc: subprocess.Popen) -> None:

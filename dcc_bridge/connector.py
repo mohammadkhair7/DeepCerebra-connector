@@ -172,7 +172,7 @@ class BridgeConnector:
         if ftype == "infer":
             rid = frame.get("request_id")
             self._tasks[rid] = asyncio.create_task(self._run_infer(ws, frame))
-        elif ftype in ("exec", "exec_sync"):
+        elif ftype in ("exec", "exec_sync", "exec_pull"):
             rid = frame.get("request_id")
             self._tasks[rid] = asyncio.create_task(self._run_exec(ws, frame))
         elif ftype == "cancel":
@@ -240,6 +240,18 @@ class BridgeConnector:
                 files = frame.get("files") or []
                 cprint(f"[connector] -> sync {len(files)} file(s) into {self.exec.workspace}", "cyan")
                 result = await asyncio.to_thread(self.exec.sync, files)
+                reply.update(ok=True, **result)
+            elif frame.get("type") == "exec_pull":
+                # Reverse sync: return files the last command created/changed so
+                # the web app can pull them back into the browser VFS/Explorer.
+                cwd = str(frame.get("cwd") or "")
+                since = float(frame.get("since") or 0.0)
+                result = await asyncio.to_thread(self.exec.snapshot, cwd, since)
+                cprint(
+                    f"[connector] -> pull {result.get('count', 0)} changed file(s) "
+                    f"from {result.get('root', cwd)}",
+                    "cyan",
+                )
                 reply.update(ok=True, **result)
             else:
                 command = str(frame.get("command") or "")
